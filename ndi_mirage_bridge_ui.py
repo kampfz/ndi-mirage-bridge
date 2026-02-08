@@ -113,6 +113,7 @@ class MirageBridgeApp(tk.Tk):
         self._build_ui()
         self._update_preview()
         self._update_status()
+        self.after(100, self._refresh_sources)
 
     # ------------------------------------------------------------------
     # Async thread
@@ -183,6 +184,21 @@ class MirageBridgeApp(tk.Tk):
         )
         ttk.Label(row_osc, text="(0 = disabled, receives /mirage/prompt)",
                   foreground="gray").pack(side="left")
+
+        # Auto Connect row
+        row_auto = ttk.Frame(config_frame)
+        row_auto.pack(fill="x", pady=2)
+        self._auto_connect_var = tk.BooleanVar(
+            value=_load_config().get("auto_connect", False)
+        )
+        ttk.Checkbutton(
+            row_auto, text="Auto Connect", variable=self._auto_connect_var,
+            command=self._save_auto_connect,
+        ).pack(side="left")
+        ttk.Label(
+            row_auto, text="(auto-selects TouchDesigner source on launch)",
+            foreground="gray",
+        ).pack(side="left", padx=(4, 0))
 
         # --- Preview frame ---
         preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=4)
@@ -263,6 +279,36 @@ class MirageBridgeApp(tk.Tk):
     def _toggle_key_visibility(self):
         self._api_key_entry.config(show="" if self._show_key_var.get() else "*")
 
+    def _save_auto_connect(self):
+        cfg = _load_config()
+        cfg["auto_connect"] = self._auto_connect_var.get()
+        _save_config(cfg)
+
+    # ------------------------------------------------------------------
+    # Auto-connect on launch
+    # ------------------------------------------------------------------
+
+    def _try_auto_connect(self):
+        """After discovery, auto-select a TouchDesigner source and connect."""
+        if not self._auto_connect_var.get():
+            return
+        if not self._api_key_var.get().strip():
+            return
+
+        sources = list(self._source_combo["values"])
+        td_source = None
+        for s in sources:
+            if "touchdesigner" in s.lower():
+                td_source = s
+                break
+
+        if td_source is None:
+            self._status_var.set("Auto-connect: no TouchDesigner source found")
+            return
+
+        self._source_var.set(td_source)
+        self._on_connect()
+
     # ------------------------------------------------------------------
     # NDI source discovery
     # ------------------------------------------------------------------
@@ -285,6 +331,7 @@ class MirageBridgeApp(tk.Tk):
             self._source_combo["values"] = sources
             self._source_combo.current(0)
             self._status_var.set(f"Found {len(sources)} NDI source(s)")
+            self._try_auto_connect()
         else:
             self._status_var.set("No NDI sources found")
 
@@ -396,7 +443,7 @@ class MirageBridgeApp(tk.Tk):
         self._status_var.set("Connected")
         # Start OSC server for remote prompt control
         self._start_osc_server()
-        # Persist the API key for next launch
+        # Persist config for next launch
         cfg = _load_config()
         cfg["api_key"] = self._api_key_var.get().strip()
         _save_config(cfg)
