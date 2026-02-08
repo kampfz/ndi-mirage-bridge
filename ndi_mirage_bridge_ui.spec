@@ -17,18 +17,26 @@ else:
 cyndilib_bin = site_packages / "cyndilib" / "wrapper" / "bin"
 cyndilib_dest = os.path.join("cyndilib", "wrapper", "bin")
 
+cyndilib_wrapper_dest = os.path.join("cyndilib", "wrapper")
+
 if sys.platform == "win32":
     ndi_libs = [(str(f), cyndilib_dest) for f in cyndilib_bin.glob("*.dll")]
     cyndilib_exts = [(str(f), "cyndilib")
                      for f in (site_packages / "cyndilib").glob("*.pyd")]
+    cyndilib_exts += [(str(f), cyndilib_wrapper_dest)
+                      for f in (site_packages / "cyndilib" / "wrapper").glob("*.pyd")]
 elif sys.platform == "darwin":
     ndi_libs = [(str(f), cyndilib_dest) for f in cyndilib_bin.glob("*.dylib")]
     cyndilib_exts = [(str(f), "cyndilib")
                      for f in (site_packages / "cyndilib").glob("*.so")]
+    cyndilib_exts += [(str(f), cyndilib_wrapper_dest)
+                      for f in (site_packages / "cyndilib" / "wrapper").glob("*.so")]
 else:
     ndi_libs = [(str(f), cyndilib_dest) for f in cyndilib_bin.glob("*.so*")]
     cyndilib_exts = [(str(f), "cyndilib")
                      for f in (site_packages / "cyndilib").glob("*.so")]
+    cyndilib_exts += [(str(f), cyndilib_wrapper_dest)
+                      for f in (site_packages / "cyndilib" / "wrapper").glob("*.so")]
 
 a = Analysis(
     ["ndi_mirage_bridge_ui.py"],
@@ -50,6 +58,10 @@ a = Analysis(
         "cyndilib.metadata_frame",
         "cyndilib.audio_reference",
         "cyndilib.send_frame_status",
+        "cyndilib.wrapper.common",
+        "cyndilib.wrapper.ndi_recv",
+        "cyndilib.wrapper.ndi_send",
+        "cyndilib.wrapper.ndi_structs",
         "decart",
         "decart.realtime",
         "aiortc",
