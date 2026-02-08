@@ -1,0 +1,546 @@
+"""
+NDI-Mirage Bridge — Tkinter GUI
+
+Desktop GUI that wraps the core NDI/Decart pipeline from ndi_mirage_bridge.py.
+Provides: NDI source picker, API key input, prompt presets, live preview,
+and FPS/status monitoring.
+
+Usage:
+  python ndi_mirage_bridge_ui.py
+"""
+
+import asyncio
+import json
+import logging
+import os
+import queue
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+from aiortc import MediaStreamTrack
+from decart import DecartClient, models
+from decart.realtime import RealtimeClient, RealtimeConnectOptions
+from decart.types import ModelState, Prompt
+
+from ndi_mirage_bridge import (
+    DECART_MODEL,
+    TARGET_FPS,
+    TARGET_WIDTH,
+    TARGET_HEIGHT,
+    FrameBuffer,
+    NDIReceiver,
+    NDISender,
+    NDIVideoTrack,
+    RemoteStreamConsumer,
+)
+
+logger = logging.getLogger(__name__)
+
+PREVIEW_WIDTH = 480
+PREVIEW_HEIGHT = 264
+
+STYLE_PRESETS = [
+    "Cyberpunk",
+    "Anime",
+    "Watercolor",
+    "Oil Painting",
+    "Pixel Art",
+    "Comic Book",
+    "Pencil Sketch",
+    "Neon Glow",
+]
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+
+def _load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+class MirageBridgeApp(tk.Tk):
+    """Main application window for the NDI-Mirage Bridge GUI."""
+
+    def __init__(self):
+        super().__init__()
+        self.title("NDI-Mirage Bridge")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # --- State ---
+        self._connected = False
+        self._ndi_receiver: Optional[NDIReceiver] = None
+        self._ndi_sender: Optional[NDISender] = None
+        self._video_track: Optional[NDIVideoTrack] = None
+        self._consumer: Optional[RemoteStreamConsumer] = None
+        self._realtime_client: Optional[RealtimeClient] = None
+        self._input_buffer: Optional[FrameBuffer] = None
+        self._preview_buffer: Optional[FrameBuffer] = None
+        self._output_queue: Optional[queue.Queue] = None
+        self._input_preview_photo: Optional[ImageTk.PhotoImage] = None
+        self._output_preview_photo: Optional[ImageTk.PhotoImage] = None
+
+        # --- Asyncio event loop in background thread ---
+        self._loop = asyncio.new_event_loop()
+        if sys.platform == "win32":
+            # aiortc requires SelectorEventLoop on Windows
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            self._loop = asyncio.SelectorEventLoop()
+        self._async_thread = threading.Thread(
+            target=self._run_async_loop, daemon=True, name="asyncio"
+        )
+        self._async_thread.start()
+
+        self._build_ui()
+        self._update_preview()
+        self._update_status()
+
+    # ------------------------------------------------------------------
+    # Async thread
+    # ------------------------------------------------------------------
+
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _submit_async(self, coro):
+        """Schedule a coroutine on the asyncio thread and return a Future."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        pad = dict(padx=8, pady=4)
+
+        # --- Top config frame ---
+        config_frame = ttk.LabelFrame(self, text="Configuration", padding=8)
+        config_frame.pack(fill="x", **pad)
+
+        # API Key row
+        row_api = ttk.Frame(config_frame)
+        row_api.pack(fill="x", pady=2)
+        ttk.Label(row_api, text="API Key:").pack(side="left")
+        saved_key = os.getenv("DECART_API_KEY", "") or _load_config().get("api_key", "")
+        self._api_key_var = tk.StringVar(value=saved_key)
+        self._api_key_entry = ttk.Entry(row_api, textvariable=self._api_key_var, show="*", width=48)
+        self._api_key_entry.pack(side="left", padx=(4, 2), fill="x", expand=True)
+        self._show_key_var = tk.BooleanVar(value=False)
+        self._show_key_btn = ttk.Checkbutton(
+            row_api, text="Show", variable=self._show_key_var,
+            command=self._toggle_key_visibility
+        )
+        self._show_key_btn.pack(side="left", padx=2)
+
+        # NDI Source row
+        row_ndi = ttk.Frame(config_frame)
+        row_ndi.pack(fill="x", pady=2)
+        ttk.Label(row_ndi, text="NDI Source:").pack(side="left")
+        self._source_var = tk.StringVar()
+        self._source_combo = ttk.Combobox(
+            row_ndi, textvariable=self._source_var, state="readonly", width=44
+        )
+        self._source_combo.pack(side="left", padx=(4, 2), fill="x", expand=True)
+        self._refresh_btn = ttk.Button(row_ndi, text="Refresh", command=self._refresh_sources)
+        self._refresh_btn.pack(side="left", padx=2)
+
+        # Output name row
+        row_out = ttk.Frame(config_frame)
+        row_out.pack(fill="x", pady=2)
+        ttk.Label(row_out, text="Output Name:").pack(side="left")
+        self._output_name_var = tk.StringVar(value="NDI-Mirage-Output")
+        ttk.Entry(row_out, textvariable=self._output_name_var, width=48).pack(
+            side="left", padx=(4, 0), fill="x", expand=True
+        )
+
+        # --- Preview frame ---
+        preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=4)
+        preview_frame.pack(fill="both", **pad)
+
+        black = Image.new("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), (0, 0, 0))
+
+        # Input preview (left)
+        input_frame = ttk.LabelFrame(preview_frame, text="NDI Input", padding=2)
+        input_frame.pack(side="left", padx=(0, 4))
+        self._input_preview_label = ttk.Label(input_frame, anchor="center")
+        self._input_preview_label.pack()
+        self._input_preview_photo = ImageTk.PhotoImage(black)
+        self._input_preview_label.config(image=self._input_preview_photo)
+
+        # Output preview (right)
+        output_frame = ttk.LabelFrame(preview_frame, text="Mirage Output", padding=2)
+        output_frame.pack(side="left", padx=(4, 0))
+        self._output_preview_label = ttk.Label(output_frame, anchor="center")
+        self._output_preview_label.pack()
+        self._output_preview_photo = ImageTk.PhotoImage(black)
+        self._output_preview_label.config(image=self._output_preview_photo)
+
+        # --- Prompt frame ---
+        prompt_frame = ttk.LabelFrame(self, text="Style Prompt", padding=8)
+        prompt_frame.pack(fill="x", **pad)
+
+        row_prompt = ttk.Frame(prompt_frame)
+        row_prompt.pack(fill="x", pady=2)
+        self._prompt_var = tk.StringVar(value="Cyberpunk city")
+        ttk.Entry(row_prompt, textvariable=self._prompt_var, width=52).pack(
+            side="left", padx=(0, 4), fill="x", expand=True
+        )
+        self._apply_btn = ttk.Button(row_prompt, text="Apply", command=self._apply_prompt)
+        self._apply_btn.pack(side="left")
+
+        # Preset buttons — two rows
+        presets_frame1 = ttk.Frame(prompt_frame)
+        presets_frame1.pack(fill="x", pady=(4, 0))
+        presets_frame2 = ttk.Frame(prompt_frame)
+        presets_frame2.pack(fill="x", pady=2)
+
+        for i, preset in enumerate(STYLE_PRESETS):
+            parent = presets_frame1 if i < 4 else presets_frame2
+            btn = ttk.Button(
+                parent, text=preset,
+                command=lambda p=preset: self._on_preset_click(p)
+            )
+            btn.pack(side="left", padx=2)
+
+        # --- Connect / Disconnect buttons ---
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", **pad)
+        self._connect_btn = ttk.Button(btn_frame, text="Connect", command=self._on_connect)
+        self._connect_btn.pack(side="left", padx=(8, 4), expand=True, fill="x")
+        self._disconnect_btn = ttk.Button(
+            btn_frame, text="Disconnect", command=self._on_disconnect, state="disabled"
+        )
+        self._disconnect_btn.pack(side="left", padx=(4, 8), expand=True, fill="x")
+
+        # --- Status bar ---
+        status_frame = ttk.Frame(self, relief="sunken", padding=4)
+        status_frame.pack(fill="x", side="bottom")
+        self._status_var = tk.StringVar(value="Disconnected")
+        self._input_fps_var = tk.StringVar(value="Input FPS: --")
+        self._output_fps_var = tk.StringVar(value="Output FPS: --")
+
+        ttk.Label(status_frame, textvariable=self._status_var).pack(side="left", padx=8)
+        ttk.Separator(status_frame, orient="vertical").pack(side="left", fill="y", padx=4)
+        ttk.Label(status_frame, textvariable=self._input_fps_var).pack(side="left", padx=8)
+        ttk.Separator(status_frame, orient="vertical").pack(side="left", fill="y", padx=4)
+        ttk.Label(status_frame, textvariable=self._output_fps_var).pack(side="left", padx=8)
+
+    # ------------------------------------------------------------------
+    # Key visibility
+    # ------------------------------------------------------------------
+
+    def _toggle_key_visibility(self):
+        self._api_key_entry.config(show="" if self._show_key_var.get() else "*")
+
+    # ------------------------------------------------------------------
+    # NDI source discovery
+    # ------------------------------------------------------------------
+
+    def _refresh_sources(self):
+        self._refresh_btn.config(state="disabled")
+        self._source_combo.set("")
+        self._source_combo["values"] = ()
+        self._status_var.set("Discovering NDI sources...")
+
+        def _discover():
+            sources = NDIReceiver.discover_sources(timeout_sec=5.0)
+            self.after(0, lambda: self._on_discovery_done(sources))
+
+        threading.Thread(target=_discover, daemon=True, name="ndi-discover").start()
+
+    def _on_discovery_done(self, sources):
+        self._refresh_btn.config(state="normal")
+        if sources:
+            self._source_combo["values"] = sources
+            self._source_combo.current(0)
+            self._status_var.set(f"Found {len(sources)} NDI source(s)")
+        else:
+            self._status_var.set("No NDI sources found")
+
+    # ------------------------------------------------------------------
+    # Connect
+    # ------------------------------------------------------------------
+
+    def _on_connect(self):
+        api_key = self._api_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror("Error", "API Key is required.")
+            return
+
+        source = self._source_var.get().strip()
+        if not source:
+            messagebox.showerror("Error", "Select an NDI source first (click Refresh).")
+            return
+
+        output_name = self._output_name_var.get().strip() or "NDI-Mirage-Output"
+        prompt_text = self._prompt_var.get().strip() or "Cyberpunk city"
+
+        self._connect_btn.config(state="disabled")
+        self._disconnect_btn.config(state="disabled")
+        self._status_var.set("Connecting...")
+
+        def _do_connect():
+            try:
+                # Shared data structures
+                self._input_buffer = FrameBuffer()
+                self._preview_buffer = FrameBuffer()
+                self._output_queue = queue.Queue(maxsize=2)
+
+                # Start NDI receiver
+                self._ndi_receiver = NDIReceiver(source, self._input_buffer)
+                self._ndi_receiver.start()
+
+                # Wait for first frame
+                self.after(0, lambda: self._status_var.set("Waiting for NDI frames..."))
+                got_frame = self._input_buffer.wait_for_first_frame(30.0)
+                if not got_frame:
+                    self._ndi_receiver.stop()
+                    self.after(0, lambda: self._connect_failed(
+                        "Timed out waiting for NDI frames. Check source is active."
+                    ))
+                    return
+
+                # Start NDI sender
+                self._ndi_sender = NDISender(output_name, self._output_queue)
+                self._ndi_sender.start()
+
+                # Create video track and consumer
+                self._video_track = NDIVideoTrack(self._input_buffer)
+                self._consumer = RemoteStreamConsumer(
+                    self._output_queue, preview_buffer=self._preview_buffer
+                )
+
+                # Connect to Decart (async, non-blocking)
+                self.after(0, lambda: self._status_var.set("Connecting to Decart..."))
+                future = self._submit_async(self._async_connect(api_key, prompt_text))
+                future.add_done_callback(self._on_decart_connect_done)
+
+            except Exception as e:
+                logger.exception("Connection setup failed")
+                msg = str(e)
+                self.after(0, lambda: self._connect_failed(msg))
+
+        threading.Thread(target=_do_connect, daemon=True, name="connect").start()
+
+    def _on_decart_connect_done(self, future):
+        """Callback fired when the async Decart connection resolves."""
+        try:
+            future.result()
+            self.after(0, self._connect_succeeded)
+        except Exception as e:
+            logger.error("Decart connection failed: %s", e)
+            msg = str(e)
+            self.after(0, lambda: self._connect_failed(msg))
+
+    async def _async_connect(self, api_key: str, prompt_text: str):
+        model = models.realtime(DECART_MODEL)
+        client = DecartClient(api_key=api_key)
+
+        self._realtime_client = await RealtimeClient.connect(
+            base_url=client.base_url,
+            api_key=client.api_key,
+            local_track=self._video_track,
+            options=RealtimeConnectOptions(
+                model=model,
+                on_remote_stream=self._consumer.on_remote_stream,
+                initial_state=ModelState(
+                    prompt=Prompt(text=prompt_text, enrich=True)
+                ),
+            ),
+        )
+
+        def on_connection_change(state):
+            logger.info("Decart connection: %s", state)
+
+        def on_error(error):
+            logger.error("Decart error: %s", error)
+
+        self._realtime_client.on("connection_change", on_connection_change)
+        self._realtime_client.on("error", on_error)
+
+    def _connect_succeeded(self):
+        self._connected = True
+        self._connect_btn.config(state="disabled")
+        self._disconnect_btn.config(state="normal")
+        self._status_var.set("Connected")
+        # Persist the API key for next launch
+        cfg = _load_config()
+        cfg["api_key"] = self._api_key_var.get().strip()
+        _save_config(cfg)
+
+    def _connect_failed(self, msg: str):
+        self._connect_btn.config(state="normal")
+        self._disconnect_btn.config(state="disabled")
+        self._status_var.set("Disconnected")
+        messagebox.showerror("Connection Failed", msg)
+
+    # ------------------------------------------------------------------
+    # Disconnect
+    # ------------------------------------------------------------------
+
+    def _on_disconnect(self):
+        if not self._connected:
+            return
+        self._disconnect_btn.config(state="disabled")
+        self._status_var.set("Disconnecting...")
+
+        def _do_disconnect():
+            try:
+                if self._consumer:
+                    self._submit_async(self._consumer.stop()).result(timeout=10)
+                if self._realtime_client:
+                    self._submit_async(self._realtime_client.disconnect()).result(timeout=10)
+                if self._ndi_sender:
+                    self._ndi_sender.stop()
+                if self._ndi_receiver:
+                    self._ndi_receiver.stop()
+            except Exception:
+                logger.exception("Error during disconnect")
+            finally:
+                self.after(0, self._disconnect_done)
+
+        threading.Thread(target=_do_disconnect, daemon=True, name="disconnect").start()
+
+    def _disconnect_done(self):
+        self._connected = False
+        self._realtime_client = None
+        self._consumer = None
+        self._video_track = None
+        self._ndi_receiver = None
+        self._ndi_sender = None
+        self._input_buffer = None
+        self._preview_buffer = None
+        self._output_queue = None
+        self._connect_btn.config(state="normal")
+        self._disconnect_btn.config(state="disabled")
+        self._status_var.set("Disconnected")
+        self._input_fps_var.set("Input FPS: --")
+        self._output_fps_var.set("Output FPS: --")
+        # Reset both previews to black
+        black = Image.new("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), (0, 0, 0))
+        self._input_preview_photo = ImageTk.PhotoImage(black)
+        self._input_preview_label.config(image=self._input_preview_photo)
+        self._output_preview_photo = ImageTk.PhotoImage(black)
+        self._output_preview_label.config(image=self._output_preview_photo)
+
+    # ------------------------------------------------------------------
+    # Prompt
+    # ------------------------------------------------------------------
+
+    def _apply_prompt(self):
+        if not self._connected or not self._realtime_client:
+            return
+        text = self._prompt_var.get().strip()
+        if not text:
+            return
+
+        async def _set():
+            try:
+                await self._realtime_client.set_prompt(text)
+                logger.info("Prompt changed to: %s", text)
+            except Exception as e:
+                logger.error("Error changing prompt: %s", e)
+
+        self._submit_async(_set())
+
+    def _on_preset_click(self, preset_text: str):
+        self._prompt_var.set(preset_text)
+        self._apply_prompt()
+
+    # ------------------------------------------------------------------
+    # Preview update (~30 fps)
+    # ------------------------------------------------------------------
+
+    def _update_preview(self):
+        # Input preview (raw NDI feed)
+        if self._input_buffer is not None:
+            frame = self._input_buffer.get()
+            if frame is not None:
+                try:
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                    img_rgb = cv2.resize(
+                        img_rgb, (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    pil_img = Image.fromarray(img_rgb)
+                    self._input_preview_photo = ImageTk.PhotoImage(pil_img)
+                    self._input_preview_label.config(image=self._input_preview_photo)
+                except Exception:
+                    pass
+
+        # Output preview (Decart processed)
+        if self._preview_buffer is not None:
+            frame = self._preview_buffer.get()
+            if frame is not None:
+                try:
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                    img_rgb = cv2.resize(
+                        img_rgb, (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    pil_img = Image.fromarray(img_rgb)
+                    self._output_preview_photo = ImageTk.PhotoImage(pil_img)
+                    self._output_preview_label.config(image=self._output_preview_photo)
+                except Exception:
+                    pass
+
+        self.after(33, self._update_preview)  # ~30 fps
+
+    # ------------------------------------------------------------------
+    # Status bar update (~2 Hz)
+    # ------------------------------------------------------------------
+
+    def _update_status(self):
+        if self._connected:
+            if self._input_buffer:
+                self._input_fps_var.set(f"Input FPS: {self._input_buffer.fps:.1f}")
+            if self._preview_buffer:
+                self._output_fps_var.set(f"Output FPS: {self._preview_buffer.fps:.1f}")
+
+        self.after(500, self._update_status)
+
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
+    def _on_close(self):
+        if self._connected:
+            self._on_disconnect()
+            # Give disconnect a moment to finish
+            self.after(2000, self._final_close)
+        else:
+            self._final_close()
+
+    def _final_close(self):
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self.destroy()
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    app = MirageBridgeApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
