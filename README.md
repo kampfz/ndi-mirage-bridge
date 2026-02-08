@@ -50,6 +50,43 @@ The left preview shows your raw NDI input, the right shows the Decart Mirage out
 
 Type a style prompt (e.g. "Watercolor painting") and click **Apply**, or use one of the preset buttons.
 
+## OSC Remote Prompt Control
+
+The bridge includes an OSC (Open Sound Control) server for remote prompt changes — ideal for integration with TouchDesigner, Max/MSP, QLab, or any OSC-capable application.
+
+### OSC Message Format
+
+| Field   | Value              |
+|---------|--------------------|
+| Address | `/mirage/prompt`   |
+| Type    | string             |
+| Example | `/mirage/prompt "Watercolor painting"` |
+
+### GUI Mode
+
+The OSC Port field in the Configuration panel defaults to `9000`. Set it to `0` to disable. The OSC server starts automatically when you click **Connect**.
+
+### CLI Mode
+
+```bash
+python ndi_mirage_bridge.py --osc-port 9000          # default
+python ndi_mirage_bridge.py --osc-port 0              # disabled
+python ndi_mirage_bridge.py --osc-host 127.0.0.1      # localhost only
+```
+
+### TouchDesigner Setup
+
+1. Add an **OSC Out CHOP** (or **OSC Out DAT**) to your network
+2. Set the address to `127.0.0.1` (or the machine running the bridge) and port to `9000`
+3. Send a message with address `/mirage/prompt` and a string argument containing the style prompt
+4. The bridge will update the style in real time
+
+### Quick Test
+
+```bash
+python -c "from pythonosc.udp_client import SimpleUDPClient; SimpleUDPClient('127.0.0.1', 9000).send_message('/mirage/prompt', 'Oil painting')"
+```
+
 ## Headless / CLI Mode
 
 The core pipeline can also be run without the GUI:

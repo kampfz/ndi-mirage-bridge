@@ -26,6 +26,9 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from aiortc import MediaStreamTrack
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import AsyncIOOSCUDPServer
+
 from decart import DecartClient, models
 from decart.realtime import RealtimeClient, RealtimeConnectOptions
 from decart.types import ModelState, Prompt
@@ -46,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 PREVIEW_WIDTH = 480
 PREVIEW_HEIGHT = 264
+DEFAULT_OSC_PORT = 9000
 
 STYLE_PRESETS = [
     "Cyberpunk",
@@ -93,6 +97,7 @@ class MirageBridgeApp(tk.Tk):
         self._output_queue: Optional[queue.Queue] = None
         self._input_preview_photo: Optional[ImageTk.PhotoImage] = None
         self._output_preview_photo: Optional[ImageTk.PhotoImage] = None
+        self._osc_transport = None
 
         # --- Asyncio event loop in background thread ---
         self._loop = asyncio.new_event_loop()
@@ -167,6 +172,17 @@ class MirageBridgeApp(tk.Tk):
         ttk.Entry(row_out, textvariable=self._output_name_var, width=48).pack(
             side="left", padx=(4, 0), fill="x", expand=True
         )
+
+        # OSC Port row
+        row_osc = ttk.Frame(config_frame)
+        row_osc.pack(fill="x", pady=2)
+        ttk.Label(row_osc, text="OSC Port:").pack(side="left")
+        self._osc_port_var = tk.StringVar(value=str(DEFAULT_OSC_PORT))
+        ttk.Entry(row_osc, textvariable=self._osc_port_var, width=8).pack(
+            side="left", padx=(4, 4)
+        )
+        ttk.Label(row_osc, text="(0 = disabled, receives /mirage/prompt)",
+                  foreground="gray").pack(side="left")
 
         # --- Preview frame ---
         preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=4)
@@ -378,6 +394,8 @@ class MirageBridgeApp(tk.Tk):
         self._connect_btn.config(state="disabled")
         self._disconnect_btn.config(state="normal")
         self._status_var.set("Connected")
+        # Start OSC server for remote prompt control
+        self._start_osc_server()
         # Persist the API key for next launch
         cfg = _load_config()
         cfg["api_key"] = self._api_key_var.get().strip()
@@ -417,6 +435,7 @@ class MirageBridgeApp(tk.Tk):
         threading.Thread(target=_do_disconnect, daemon=True, name="disconnect").start()
 
     def _disconnect_done(self):
+        self._stop_osc_server()
         self._connected = False
         self._realtime_client = None
         self._consumer = None
@@ -461,6 +480,55 @@ class MirageBridgeApp(tk.Tk):
     def _on_preset_click(self, preset_text: str):
         self._prompt_var.set(preset_text)
         self._apply_prompt()
+
+    # ------------------------------------------------------------------
+    # OSC
+    # ------------------------------------------------------------------
+
+    def _handle_osc_prompt(self, address, *osc_args):
+        """Called from the asyncio thread when an OSC /mirage/prompt message arrives."""
+        if not osc_args:
+            return
+        new_prompt = str(osc_args[0])
+        logger.info("OSC prompt received: %s", new_prompt)
+        # Update the Tk StringVar on the main thread
+        self.after(0, lambda: self._prompt_var.set(new_prompt))
+        # Send to Decart
+        if self._realtime_client:
+            self._submit_async(self._realtime_client.set_prompt(new_prompt))
+
+    def _start_osc_server(self):
+        """Start the OSC server on the asyncio loop. Call after connection succeeds."""
+        try:
+            port = int(self._osc_port_var.get())
+        except ValueError:
+            port = 0
+        if port <= 0:
+            logger.info("OSC disabled (port=0)")
+            return
+
+        dispatcher = Dispatcher()
+        dispatcher.map("/mirage/prompt", self._handle_osc_prompt)
+
+        async def _serve():
+            osc_server = AsyncIOOSCUDPServer(
+                ("0.0.0.0", port), dispatcher, self._loop
+            )
+            transport, _ = await osc_server.create_serve_endpoint()
+            return transport
+
+        future = self._submit_async(_serve())
+        try:
+            self._osc_transport = future.result(timeout=5)
+            logger.info("OSC server listening on 0.0.0.0:%d", port)
+        except Exception as e:
+            logger.error("Failed to start OSC server: %s", e)
+
+    def _stop_osc_server(self):
+        """Close the OSC transport if running."""
+        if self._osc_transport is not None:
+            self._osc_transport.close()
+            self._osc_transport = None
 
     # ------------------------------------------------------------------
     # Preview update (~30 fps)

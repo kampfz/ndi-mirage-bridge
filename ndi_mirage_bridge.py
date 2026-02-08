@@ -38,6 +38,9 @@ from cyndilib.video_frame import VideoFrameSync, VideoSendFrame
 from cyndilib.wrapper.ndi_recv import RecvColorFormat, RecvBandwidth
 from cyndilib.wrapper.ndi_structs import FourCC
 
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import AsyncIOOSCUDPServer
+
 from decart import DecartClient, models
 from decart.realtime import RealtimeClient, RealtimeConnectOptions
 from decart.types import ModelState, Prompt
@@ -509,6 +512,17 @@ async def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--osc-port",
+        type=int,
+        default=9000,
+        help="OSC listen port for remote prompt control (0 to disable, default: 9000)",
+    )
+    parser.add_argument(
+        "--osc-host",
+        default="0.0.0.0",
+        help="OSC listen host (default: 0.0.0.0)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -579,6 +593,25 @@ async def main() -> None:
     realtime_client.on("connection_change", on_connection_change)
     realtime_client.on("error", on_error)
 
+    # --- Start OSC server (if enabled) ---
+    osc_transport = None
+    if args.osc_port > 0:
+        dispatcher = Dispatcher()
+
+        def _osc_prompt_handler(address, *osc_args):
+            if osc_args:
+                new_prompt = str(osc_args[0])
+                logger.info("OSC prompt received: %s", new_prompt)
+                asyncio.ensure_future(realtime_client.set_prompt(new_prompt))
+
+        dispatcher.map("/mirage/prompt", _osc_prompt_handler)
+
+        osc_server = AsyncIOOSCUDPServer(
+            (args.osc_host, args.osc_port), dispatcher, asyncio.get_event_loop()
+        )
+        osc_transport, _ = await osc_server.create_serve_endpoint()
+        logger.info("OSC server listening on %s:%d", args.osc_host, args.osc_port)
+
     print()
     print("=" * 60)
     print("  NDI-Mirage Bridge is ACTIVE")
@@ -586,6 +619,10 @@ async def main() -> None:
     print(f"  NDI Output: {args.sender_name}")
     print(f"  Model:      {DECART_MODEL} ({TARGET_WIDTH}x{TARGET_HEIGHT} @ {TARGET_FPS}fps)")
     print(f"  Prompt:     {prompt_text}")
+    if args.osc_port > 0:
+        print(f"  OSC:        {args.osc_host}:{args.osc_port}  /mirage/prompt")
+    else:
+        print("  OSC:        disabled")
     print("=" * 60)
 
     # --- Interactive prompt loop (blocks until quit) ---
@@ -596,6 +633,8 @@ async def main() -> None:
 
     # --- Graceful shutdown ---
     print("\nShutting down...")
+    if osc_transport is not None:
+        osc_transport.close()
     await consumer.stop()
     await realtime_client.disconnect()
     ndi_sender.stop()
