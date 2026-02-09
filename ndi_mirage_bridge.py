@@ -86,6 +86,7 @@ class FrameBuffer:
         self._lock = threading.Lock()
         self._frame: Optional[np.ndarray] = None  # (H, W, 4) BGRX uint8
         self._new_frame = threading.Event()
+        self._resolution: Optional[Tuple[int, int]] = None  # (width, height)
         # FPS tracking
         self._fps_lock = threading.Lock()
         self._fps_count = 0
@@ -96,6 +97,8 @@ class FrameBuffer:
         """Store a frame (called from NDI receiver thread)."""
         with self._lock:
             self._frame = frame
+            h, w = frame.shape[:2]
+            self._resolution = (w, h)
         self._new_frame.set()
         self._tick_fps()
 
@@ -117,6 +120,12 @@ class FrameBuffer:
                 self._fps_value = self._fps_count / elapsed
                 self._fps_count = 0
                 self._fps_last_time = now
+
+    @property
+    def resolution(self) -> Optional[Tuple[int, int]]:
+        """Return (width, height) of the latest frame, or None."""
+        with self._lock:
+            return self._resolution
 
     @property
     def fps(self) -> float:
@@ -467,22 +476,13 @@ class NDIVideoTrack(VideoStreamTrack):
             # BGRX (H,W,4) -> BGR (H,W,3)
             img_bgr = raw[:, :, :3]
 
-            # Resize with letterboxing to preserve aspect ratio
+            # Resize to model dimensions (stretch is reversed on output)
             h, w = img_bgr.shape[:2]
             if w != TARGET_WIDTH or h != TARGET_HEIGHT:
-                scale = min(TARGET_WIDTH / w, TARGET_HEIGHT / h)
-                new_w = int(w * scale)
-                new_h = int(h * scale)
                 img_bgr = cv2.resize(
-                    img_bgr, (new_w, new_h),
+                    img_bgr, (TARGET_WIDTH, TARGET_HEIGHT),
                     interpolation=cv2.INTER_LINEAR,
                 )
-                # Place on black canvas
-                canvas = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
-                x_off = (TARGET_WIDTH - new_w) // 2
-                y_off = (TARGET_HEIGHT - new_h) // 2
-                canvas[y_off:y_off + new_h, x_off:x_off + new_w] = img_bgr
-                img_bgr = canvas
 
             # BGR -> RGB
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -503,9 +503,11 @@ class RemoteStreamConsumer:
     and pushes them into the output queue."""
 
     def __init__(self, output_queue: queue.Queue,
-                 preview_buffer: Optional[FrameBuffer] = None):
+                 preview_buffer: Optional[FrameBuffer] = None,
+                 input_buffer: Optional[FrameBuffer] = None):
         self._output_queue = output_queue
         self._preview_buffer = preview_buffer
+        self._input_buffer = input_buffer
         self._task: Optional[asyncio.Task] = None
 
     def on_remote_stream(self, track: MediaStreamTrack) -> None:
@@ -528,6 +530,18 @@ class RemoteStreamConsumer:
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
             img_bgrx = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
             # BGRA sets alpha=255 by default, which is what we want for BGRX
+
+            # Resize output to match input resolution
+            if self._input_buffer is not None:
+                src_res = self._input_buffer.resolution
+                if src_res is not None:
+                    src_w, src_h = src_res
+                    out_h, out_w = img_bgrx.shape[:2]
+                    if out_w != src_w or out_h != src_h:
+                        img_bgrx = cv2.resize(
+                            img_bgrx, (src_w, src_h),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
 
             # Push to output queue, dropping oldest if full
             try:
@@ -711,7 +725,7 @@ async def main() -> None:
     video_track = NDIVideoTrack(frame_buffer)
 
     # --- Remote stream consumer ---
-    consumer = RemoteStreamConsumer(output_queue)
+    consumer = RemoteStreamConsumer(output_queue, input_buffer=frame_buffer)
 
     # --- Connect to Decart Mirage ---
     model = models.realtime(DECART_MODEL)

@@ -16,6 +16,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
@@ -99,6 +100,7 @@ class MirageBridgeApp(tk.Tk):
         self._input_buffer: Optional[FrameBuffer] = None
         self._preview_buffer: Optional[FrameBuffer] = None
         self._output_queue: Optional[queue.Queue] = None
+        self._connect_time: Optional[float] = None
         self._input_preview_photo: Optional[ImageTk.PhotoImage] = None
         self._output_preview_photo: Optional[ImageTk.PhotoImage] = None
         self._osc_transport = None
@@ -285,12 +287,15 @@ class MirageBridgeApp(tk.Tk):
         self._status_var = tk.StringVar(value="Disconnected")
         self._input_fps_var = tk.StringVar(value="Input FPS: --")
         self._output_fps_var = tk.StringVar(value="Output FPS: --")
+        self._timer_var = tk.StringVar(value="")
 
         ttk.Label(status_frame, textvariable=self._status_var).pack(side="left", padx=8)
         ttk.Separator(status_frame, orient="vertical").pack(side="left", fill="y", padx=4)
         ttk.Label(status_frame, textvariable=self._input_fps_var).pack(side="left", padx=8)
         ttk.Separator(status_frame, orient="vertical").pack(side="left", fill="y", padx=4)
         ttk.Label(status_frame, textvariable=self._output_fps_var).pack(side="left", padx=8)
+        ttk.Separator(status_frame, orient="vertical").pack(side="left", fill="y", padx=4)
+        ttk.Label(status_frame, textvariable=self._timer_var).pack(side="left", padx=8)
 
     # ------------------------------------------------------------------
     # Key visibility
@@ -429,7 +434,8 @@ class MirageBridgeApp(tk.Tk):
                 # Create video track and consumer
                 self._video_track = NDIVideoTrack(self._input_buffer)
                 self._consumer = RemoteStreamConsumer(
-                    self._output_queue, preview_buffer=self._preview_buffer
+                    self._output_queue, preview_buffer=self._preview_buffer,
+                    input_buffer=self._input_buffer,
                 )
 
                 # Connect to Decart (async, non-blocking)
@@ -482,6 +488,7 @@ class MirageBridgeApp(tk.Tk):
 
     def _connect_succeeded(self):
         self._connected = True
+        self._connect_time = time.time()
         self._connect_btn.config(state="disabled")
         self._disconnect_btn.config(state="normal")
         self._status_var.set("Connected")
@@ -543,6 +550,8 @@ class MirageBridgeApp(tk.Tk):
         self._status_var.set("Disconnected")
         self._input_fps_var.set("Input FPS: --")
         self._output_fps_var.set("Output FPS: --")
+        self._connect_time = None
+        self._timer_var.set("")
         # Reset both previews to black
         black = Image.new("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), (0, 0, 0))
         self._input_preview_photo = ImageTk.PhotoImage(black)
@@ -627,18 +636,28 @@ class MirageBridgeApp(tk.Tk):
     # Preview update (~30 fps)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _letterbox_preview(frame_bgrx: np.ndarray) -> Image.Image:
+        """Resize a BGRX frame to fit the preview area, preserving aspect ratio."""
+        img_rgb = cv2.cvtColor(frame_bgrx, cv2.COLOR_BGRA2RGB)
+        h, w = img_rgb.shape[:2]
+        scale = min(PREVIEW_WIDTH / w, PREVIEW_HEIGHT / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img_rgb = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
+        x_off = (PREVIEW_WIDTH - new_w) // 2
+        y_off = (PREVIEW_HEIGHT - new_h) // 2
+        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = img_rgb
+        return Image.fromarray(canvas)
+
     def _update_preview(self):
-        # Input preview (raw NDI feed)
+        # Input preview (raw feed)
         if self._input_buffer is not None:
             frame = self._input_buffer.get()
             if frame is not None:
                 try:
-                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-                    img_rgb = cv2.resize(
-                        img_rgb, (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    pil_img = Image.fromarray(img_rgb)
+                    pil_img = self._letterbox_preview(frame)
                     self._input_preview_photo = ImageTk.PhotoImage(pil_img)
                     self._input_preview_label.config(image=self._input_preview_photo)
                 except Exception:
@@ -649,12 +668,7 @@ class MirageBridgeApp(tk.Tk):
             frame = self._preview_buffer.get()
             if frame is not None:
                 try:
-                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-                    img_rgb = cv2.resize(
-                        img_rgb, (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    pil_img = Image.fromarray(img_rgb)
+                    pil_img = self._letterbox_preview(frame)
                     self._output_preview_photo = ImageTk.PhotoImage(pil_img)
                     self._output_preview_label.config(image=self._output_preview_photo)
                 except Exception:
@@ -672,6 +686,11 @@ class MirageBridgeApp(tk.Tk):
                 self._input_fps_var.set(f"Input FPS: {self._input_buffer.fps:.1f}")
             if self._preview_buffer:
                 self._output_fps_var.set(f"Output FPS: {self._preview_buffer.fps:.1f}")
+            if self._connect_time is not None:
+                elapsed = int(time.time() - self._connect_time)
+                hours, remainder = divmod(elapsed, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                self._timer_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
         self.after(500, self._update_status)
 
