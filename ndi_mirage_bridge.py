@@ -52,6 +52,16 @@ try:
 except ImportError:
     pass
 
+# Optional Syphon support (macOS-only Metal texture sharing)
+SYPHON_AVAILABLE = False
+try:
+    import syphon
+    from syphon.utils.numpy import copy_mtl_texture_to_image, copy_image_to_mtl_texture
+    from syphon.utils.raw import create_mtl_texture
+    SYPHON_AVAILABLE = True
+except ImportError:
+    pass
+
 from decart import DecartClient, models
 from decart.realtime import RealtimeClient, RealtimeConnectOptions
 from decart.types import ModelState, Prompt
@@ -307,6 +317,148 @@ class SpoutReceiver:
         names = receiver.getSenderList()
         receiver.closeOpenGL()
         return list(names)
+
+
+# ---------------------------------------------------------------------------
+# Syphon Receiver (macOS-only, Metal texture sharing)
+# ---------------------------------------------------------------------------
+
+
+class SyphonReceiver:
+    """Captures frames from a Syphon server in a background thread."""
+
+    def __init__(self, source_name: str, frame_buffer: FrameBuffer):
+        self._source_name = source_name
+        self._buffer = frame_buffer
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="syphon-recv")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        directory = syphon.SyphonServerDirectory()
+
+        # Find the server matching source_name by app_name
+        server_desc = None
+        deadline = time.time() + 15.0
+        while time.time() < deadline and self._running:
+            for s in directory.servers:
+                if self._source_name in s.app_name:
+                    server_desc = s
+                    break
+            if server_desc is not None:
+                break
+            time.sleep(0.5)
+
+        if server_desc is None:
+            logger.error("Syphon server '%s' not found", self._source_name)
+            return
+
+        logger.info("Connecting to Syphon server: %s", server_desc.app_name)
+
+        client = syphon.SyphonMetalClient(server_desc)
+        logger.info("Syphon receiver connected, capturing frames...")
+
+        target_interval = 1.0 / 60.0
+        next_time = time.perf_counter()
+
+        while self._running:
+            now = time.perf_counter()
+            sleep_for = next_time - now
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            next_time = max(now, next_time) + target_interval
+
+            if not client.has_new_frame:
+                continue
+
+            texture = client.new_frame_image
+            if texture is None:
+                continue
+
+            frame = copy_mtl_texture_to_image(texture)
+            if frame is None:
+                continue
+
+            # Metal textures have a flipped Y-axis origin; flip vertically
+            frame = cv2.flip(frame, 0)
+
+            # Metal textures are BGRA by default, which matches our BGRX buffer
+            self._buffer.put(frame)
+
+        client.stop()
+        logger.info("Syphon receiver stopped")
+
+    @staticmethod
+    def discover_sources() -> list:
+        """Discover available Syphon servers. Returns list of app name strings."""
+        directory = syphon.SyphonServerDirectory()
+        # Give the directory a moment to populate
+        time.sleep(1.0)
+        return [s.app_name for s in directory.servers]
+
+
+# ---------------------------------------------------------------------------
+# Syphon Sender (macOS-only, Metal texture sharing)
+# ---------------------------------------------------------------------------
+
+
+class SyphonSender:
+    """Sends processed frames out via Syphon in a background thread."""
+
+    def __init__(self, sender_name: str, output_queue: queue.Queue):
+        self._sender_name = sender_name
+        self._output_queue = output_queue
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="syphon-send")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        server = syphon.SyphonMetalServer(self._sender_name)
+        logger.info("Syphon sender starting as '%s'", self._sender_name)
+
+        texture = None
+        cur_w, cur_h = 0, 0
+
+        while self._running:
+            try:
+                img_bgrx = self._output_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            h, w = img_bgrx.shape[:2]
+            if w == 0 or h == 0:
+                continue
+
+            # Re-create texture when resolution changes
+            if w != cur_w or h != cur_h:
+                cur_w, cur_h = w, h
+                texture = create_mtl_texture(server.device, cur_w, cur_h)
+                logger.info("Syphon sender resolution: %dx%d", cur_w, cur_h)
+
+            # BGRX is already BGRA-compatible (Metal's native format)
+            copy_image_to_mtl_texture(img_bgrx, texture)
+            server.publish_frame_texture(texture)
+
+        server.stop()
+        logger.info("Syphon sender stopped")
 
 
 # ---------------------------------------------------------------------------

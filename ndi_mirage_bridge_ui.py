@@ -45,10 +45,14 @@ from ndi_mirage_bridge import (
     NDIVideoTrack,
     RemoteStreamConsumer,
     SPOUT_AVAILABLE,
+    SYPHON_AVAILABLE,
 )
 
 if SPOUT_AVAILABLE:
     from ndi_mirage_bridge import SpoutReceiver, SpoutSender
+
+if SYPHON_AVAILABLE:
+    from ndi_mirage_bridge import SyphonReceiver, SyphonSender
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +96,7 @@ class MirageBridgeApp(tk.Tk):
 
         # --- State ---
         self._connected = False
+        self._cancel_requested = False
         self._receiver: Optional[NDIReceiver] = None
         self._sender: Optional[NDISender] = None
         self._video_track: Optional[NDIVideoTrack] = None
@@ -166,6 +171,8 @@ class MirageBridgeApp(tk.Tk):
         transport_options = ["NDI"]
         if SPOUT_AVAILABLE:
             transport_options.append("Spout")
+        if SYPHON_AVAILABLE:
+            transport_options.append("Syphon")
         self._transport_var = tk.StringVar(value=transport_options[0])
         self._transport_combo = ttk.Combobox(
             row_transport, textvariable=self._transport_var,
@@ -360,6 +367,8 @@ class MirageBridgeApp(tk.Tk):
         def _discover():
             if transport == "Spout" and SPOUT_AVAILABLE:
                 sources = SpoutReceiver.discover_sources()
+            elif transport == "Syphon" and SYPHON_AVAILABLE:
+                sources = SyphonReceiver.discover_sources()
             else:
                 sources = NDIReceiver.discover_sources(timeout_sec=5.0)
             self.after(0, lambda: self._on_discovery_done(sources, transport))
@@ -395,13 +404,18 @@ class MirageBridgeApp(tk.Tk):
         output_name = self._output_name_var.get().strip() or "NDI-Mirage-Output"
         prompt_text = self._prompt_var.get().strip() or "Cyberpunk city"
 
-        self._connect_btn.config(state="disabled")
+        self._cancel_requested = False
+        self._connect_btn.config(text="Cancel", command=self._on_cancel_connect)
         self._disconnect_btn.config(state="disabled")
         self._transport_combo.config(state="disabled")
         self._status_var.set("Connecting...")
 
         def _do_connect():
             try:
+                if self._cancel_requested:
+                    self.after(0, self._connect_cancelled)
+                    return
+
                 # Shared data structures
                 self._input_buffer = FrameBuffer()
                 self._preview_buffer = FrameBuffer()
@@ -410,13 +424,26 @@ class MirageBridgeApp(tk.Tk):
                 # Start receiver
                 if transport == "Spout" and SPOUT_AVAILABLE:
                     self._receiver = SpoutReceiver(source, self._input_buffer)
+                elif transport == "Syphon" and SYPHON_AVAILABLE:
+                    self._receiver = SyphonReceiver(source, self._input_buffer)
                 else:
                     self._receiver = NDIReceiver(source, self._input_buffer)
                 self._receiver.start()
 
-                # Wait for first frame
+                # Wait for first frame (check cancel in a loop)
                 self.after(0, lambda: self._status_var.set(f"Waiting for {transport} frames..."))
-                got_frame = self._input_buffer.wait_for_first_frame(30.0)
+                deadline = time.time() + 30.0
+                got_frame = False
+                while time.time() < deadline and not self._cancel_requested:
+                    if self._input_buffer.wait_for_first_frame(0.5):
+                        got_frame = True
+                        break
+
+                if self._cancel_requested:
+                    self._receiver.stop()
+                    self.after(0, self._connect_cancelled)
+                    return
+
                 if not got_frame:
                     self._receiver.stop()
                     self.after(0, lambda: self._connect_failed(
@@ -427,9 +454,17 @@ class MirageBridgeApp(tk.Tk):
                 # Start sender
                 if transport == "Spout" and SPOUT_AVAILABLE:
                     self._sender = SpoutSender(output_name, self._output_queue)
+                elif transport == "Syphon" and SYPHON_AVAILABLE:
+                    self._sender = SyphonSender(output_name, self._output_queue)
                 else:
                     self._sender = NDISender(output_name, self._output_queue)
                 self._sender.start()
+
+                if self._cancel_requested:
+                    self._receiver.stop()
+                    self._sender.stop()
+                    self.after(0, self._connect_cancelled)
+                    return
 
                 # Create video track and consumer
                 self._video_track = NDIVideoTrack(self._input_buffer)
@@ -452,6 +487,8 @@ class MirageBridgeApp(tk.Tk):
 
     def _on_decart_connect_done(self, future):
         """Callback fired when the async Decart connection resolves."""
+        if self._cancel_requested:
+            return  # Cancel thread handles cleanup
         try:
             future.result()
             self.after(0, self._connect_succeeded)
@@ -487,9 +524,11 @@ class MirageBridgeApp(tk.Tk):
         self._realtime_client.on("error", on_error)
 
     def _connect_succeeded(self):
+        if self._cancel_requested:
+            return  # Cancel thread handles cleanup
         self._connected = True
         self._connect_time = time.time()
-        self._connect_btn.config(state="disabled")
+        self._connect_btn.config(text="Connect", command=self._on_connect, state="disabled")
         self._disconnect_btn.config(state="normal")
         self._status_var.set("Connected")
         # Start OSC server for remote prompt control
@@ -500,11 +539,51 @@ class MirageBridgeApp(tk.Tk):
         _save_config(cfg)
 
     def _connect_failed(self, msg: str):
-        self._connect_btn.config(state="normal")
+        if self._cancel_requested:
+            return  # Cancel thread handles cleanup
+        self._connect_btn.config(text="Connect", command=self._on_connect, state="normal")
         self._disconnect_btn.config(state="disabled")
         self._transport_combo.config(state="readonly")
         self._status_var.set("Disconnected")
         messagebox.showerror("Connection Failed", msg)
+
+    def _on_cancel_connect(self):
+        """User clicked Cancel during connection."""
+        self._cancel_requested = True
+        self._connect_btn.config(state="disabled")
+        self._status_var.set("Cancelling...")
+
+        def _do_cancel():
+            try:
+                if self._consumer:
+                    self._submit_async(self._consumer.stop()).result(timeout=5)
+                if self._realtime_client:
+                    self._submit_async(self._realtime_client.disconnect()).result(timeout=5)
+                    self._realtime_client = None
+                if self._sender:
+                    self._sender.stop()
+                if self._receiver:
+                    self._receiver.stop()
+            except Exception:
+                logger.exception("Error during cancel")
+            finally:
+                self.after(0, self._connect_cancelled)
+
+        threading.Thread(target=_do_cancel, daemon=True, name="cancel").start()
+
+    def _connect_cancelled(self):
+        """Clean up after a cancelled connection attempt."""
+        self._receiver = None
+        self._sender = None
+        self._video_track = None
+        self._consumer = None
+        self._input_buffer = None
+        self._preview_buffer = None
+        self._output_queue = None
+        self._connect_btn.config(text="Connect", command=self._on_connect, state="normal")
+        self._disconnect_btn.config(state="disabled")
+        self._transport_combo.config(state="readonly")
+        self._status_var.set("Disconnected")
 
     # ------------------------------------------------------------------
     # Disconnect
@@ -544,7 +623,7 @@ class MirageBridgeApp(tk.Tk):
         self._input_buffer = None
         self._preview_buffer = None
         self._output_queue = None
-        self._connect_btn.config(state="normal")
+        self._connect_btn.config(text="Connect", command=self._on_connect, state="normal")
         self._disconnect_btn.config(state="disabled")
         self._transport_combo.config(state="readonly")
         self._status_var.set("Disconnected")

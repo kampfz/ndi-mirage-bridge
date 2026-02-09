@@ -34,4 +34,5 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 websockets==16.0
 SpoutGL==0.1.1; sys_platform == "win32"
+syphon-python; sys_platform == "darwin"
 yarl==1.22.0

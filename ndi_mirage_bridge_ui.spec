@@ -21,6 +21,18 @@ if sys.platform == "win32":
         spout_binaries += [(str(f), "SpoutGL") for f in spout_dir.glob("*.pyd")]
         spout_binaries += [(str(f), "SpoutGL") for f in spout_dir.glob("*.dll")]
 
+# syphon-python native libraries (macOS-only)
+syphon_binaries = []
+if sys.platform == "darwin":
+    syphon_dir = site_packages / "syphon"
+    if syphon_dir.exists():
+        syphon_binaries += [(str(f), "syphon") for f in syphon_dir.glob("*.so")]
+        # Include sub-packages
+        for subdir in ["utils"]:
+            sub = syphon_dir / subdir
+            if sub.exists():
+                syphon_binaries += [(str(f), f"syphon/{subdir}") for f in sub.glob("*.so")]
+
 # cyndilib native libraries
 cyndilib_bin = site_packages / "cyndilib" / "wrapper" / "bin"
 cyndilib_dest = os.path.join("cyndilib", "wrapper", "bin")
@@ -49,7 +61,7 @@ else:
 a = Analysis(
     ["ndi_mirage_bridge_ui.py"],
     pathex=[],
-    binaries=ndi_libs + cyndilib_exts + spout_binaries,
+    binaries=ndi_libs + cyndilib_exts + spout_binaries + syphon_binaries,
     datas=[],
     hiddenimports=[
         "cyndilib",
@@ -78,6 +90,10 @@ a = Analysis(
         "pythonosc.osc_server",
         "SpoutGL",
         "SpoutGL.enums",
+        "syphon",
+        "syphon.utils",
+        "syphon.utils.numpy",
+        "syphon.utils.raw",
     ],
     hookspath=[],
     runtime_hooks=[],
