@@ -41,6 +41,17 @@ from cyndilib.wrapper.ndi_structs import FourCC
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import AsyncIOOSCUDPServer
 
+# Optional Spout support (Windows-only GPU texture sharing)
+SPOUT_AVAILABLE = False
+try:
+    import SpoutGL
+    from SpoutGL import enums as SpoutEnums
+    import array
+    from itertools import repeat
+    SPOUT_AVAILABLE = True
+except ImportError:
+    pass
+
 from decart import DecartClient, models
 from decart.realtime import RealtimeClient, RealtimeConnectOptions
 from decart.types import ModelState, Prompt
@@ -215,6 +226,132 @@ class NDIReceiver:
 
 
 # ---------------------------------------------------------------------------
+# Spout Receiver (Windows-only, GPU texture sharing)
+# ---------------------------------------------------------------------------
+
+
+class SpoutReceiver:
+    """Captures frames from a Spout sender in a background thread."""
+
+    def __init__(self, source_name: str, frame_buffer: FrameBuffer):
+        self._source_name = source_name
+        self._buffer = frame_buffer
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="spout-recv")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        receiver = SpoutGL.SpoutReceiver()
+        receiver.setReceiverName(self._source_name)
+        receiver.createOpenGL()
+
+        logger.info("Spout receiver connecting to '%s'...", self._source_name)
+
+        width = 0
+        height = 0
+        buf = array.array('B', [])
+
+        target_interval = 1.0 / 60.0  # cap at 60 fps
+        next_time = time.perf_counter()
+
+        while self._running:
+            # Pace the loop to avoid spinning at thousands of FPS
+            now = time.perf_counter()
+            sleep_for = next_time - now
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            next_time = max(now, next_time) + target_interval
+
+            result = receiver.receiveImage(buf, SpoutEnums.GL_RGBA, False, 0)
+
+            if receiver.isUpdated():
+                width = receiver.getSenderWidth()
+                height = receiver.getSenderHeight()
+                buf_size = width * height * 4
+                buf = array.array('B', repeat(0, buf_size))
+                logger.info("Spout receiver connected: %dx%d", width, height)
+
+            if result and width > 0 and height > 0:
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 4)
+                # RGBA -> BGRX (same as BGRA with alpha=255)
+                frame_bgrx = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
+                self._buffer.put(frame_bgrx)
+
+        receiver.releaseReceiver()
+        receiver.closeOpenGL()
+        logger.info("Spout receiver stopped")
+
+    @staticmethod
+    def discover_sources() -> list:
+        """Discover available Spout senders. Returns list of sender name strings."""
+        receiver = SpoutGL.SpoutReceiver()
+        receiver.createOpenGL()
+        names = receiver.getSenderList()
+        receiver.closeOpenGL()
+        return list(names)
+
+
+# ---------------------------------------------------------------------------
+# Spout Sender (Windows-only, GPU texture sharing)
+# ---------------------------------------------------------------------------
+
+
+class SpoutSender:
+    """Sends processed frames out via Spout in a background thread."""
+
+    def __init__(self, sender_name: str, output_queue: queue.Queue):
+        self._sender_name = sender_name
+        self._output_queue = output_queue
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="spout-send")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        sender = SpoutGL.SpoutSender()
+        sender.setSenderName(self._sender_name)
+        sender.createOpenGL()
+
+        logger.info("Spout sender starting as '%s'", self._sender_name)
+
+        while self._running:
+            try:
+                img_bgrx = self._output_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            h, w = img_bgrx.shape[:2]
+            if w == 0 or h == 0:
+                continue
+
+            # BGRX -> RGBA for Spout
+            img_rgba = cv2.cvtColor(img_bgrx, cv2.COLOR_BGRA2RGBA)
+            sender.sendImage(img_rgba.tobytes(), w, h, SpoutEnums.GL_RGBA, False, 0)
+            sender.setFrameSync(self._sender_name)
+
+        sender.releaseSender()
+        sender.closeOpenGL()
+        logger.info("Spout sender stopped")
+
+
+# ---------------------------------------------------------------------------
 # NDI Sender
 # ---------------------------------------------------------------------------
 
@@ -330,13 +467,22 @@ class NDIVideoTrack(VideoStreamTrack):
             # BGRX (H,W,4) -> BGR (H,W,3)
             img_bgr = raw[:, :, :3]
 
-            # Resize if needed
+            # Resize with letterboxing to preserve aspect ratio
             h, w = img_bgr.shape[:2]
             if w != TARGET_WIDTH or h != TARGET_HEIGHT:
+                scale = min(TARGET_WIDTH / w, TARGET_HEIGHT / h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
                 img_bgr = cv2.resize(
-                    img_bgr, (TARGET_WIDTH, TARGET_HEIGHT),
+                    img_bgr, (new_w, new_h),
                     interpolation=cv2.INTER_LINEAR,
                 )
+                # Place on black canvas
+                canvas = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
+                x_off = (TARGET_WIDTH - new_w) // 2
+                y_off = (TARGET_HEIGHT - new_h) // 2
+                canvas[y_off:y_off + new_h, x_off:x_off + new_w] = img_bgr
+                img_bgr = canvas
 
             # BGR -> RGB
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

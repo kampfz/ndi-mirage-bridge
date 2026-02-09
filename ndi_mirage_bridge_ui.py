@@ -43,7 +43,11 @@ from ndi_mirage_bridge import (
     NDISender,
     NDIVideoTrack,
     RemoteStreamConsumer,
+    SPOUT_AVAILABLE,
 )
+
+if SPOUT_AVAILABLE:
+    from ndi_mirage_bridge import SpoutReceiver, SpoutSender
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +91,8 @@ class MirageBridgeApp(tk.Tk):
 
         # --- State ---
         self._connected = False
-        self._ndi_receiver: Optional[NDIReceiver] = None
-        self._ndi_sender: Optional[NDISender] = None
+        self._receiver: Optional[NDIReceiver] = None
+        self._sender: Optional[NDISender] = None
         self._video_track: Optional[NDIVideoTrack] = None
         self._consumer: Optional[RemoteStreamConsumer] = None
         self._realtime_client: Optional[RealtimeClient] = None
@@ -153,10 +157,26 @@ class MirageBridgeApp(tk.Tk):
         )
         self._show_key_btn.pack(side="left", padx=2)
 
-        # NDI Source row
+        # Transport row
+        row_transport = ttk.Frame(config_frame)
+        row_transport.pack(fill="x", pady=2)
+        ttk.Label(row_transport, text="Transport:").pack(side="left")
+        transport_options = ["NDI"]
+        if SPOUT_AVAILABLE:
+            transport_options.append("Spout")
+        self._transport_var = tk.StringVar(value=transport_options[0])
+        self._transport_combo = ttk.Combobox(
+            row_transport, textvariable=self._transport_var,
+            state="readonly", values=transport_options, width=10,
+        )
+        self._transport_combo.pack(side="left", padx=(4, 2))
+        self._transport_combo.bind("<<ComboboxSelected>>", self._on_transport_changed)
+
+        # Source row
         row_ndi = ttk.Frame(config_frame)
         row_ndi.pack(fill="x", pady=2)
-        ttk.Label(row_ndi, text="NDI Source:").pack(side="left")
+        self._source_label = ttk.Label(row_ndi, text="NDI Source:")
+        self._source_label.pack(side="left")
         self._source_var = tk.StringVar()
         self._source_combo = ttk.Combobox(
             row_ndi, textvariable=self._source_var, state="readonly", width=44
@@ -207,9 +227,9 @@ class MirageBridgeApp(tk.Tk):
         black = Image.new("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), (0, 0, 0))
 
         # Input preview (left)
-        input_frame = ttk.LabelFrame(preview_frame, text="NDI Input", padding=2)
-        input_frame.pack(side="left", padx=(0, 4))
-        self._input_preview_label = ttk.Label(input_frame, anchor="center")
+        self._input_frame = ttk.LabelFrame(preview_frame, text="NDI Input", padding=2)
+        self._input_frame.pack(side="left", padx=(0, 4))
+        self._input_preview_label = ttk.Label(self._input_frame, anchor="center")
         self._input_preview_label.pack()
         self._input_preview_photo = ImageTk.PhotoImage(black)
         self._input_preview_label.config(image=self._input_preview_photo)
@@ -285,6 +305,18 @@ class MirageBridgeApp(tk.Tk):
         _save_config(cfg)
 
     # ------------------------------------------------------------------
+    # Transport switching
+    # ------------------------------------------------------------------
+
+    def _on_transport_changed(self, event=None):
+        transport = self._transport_var.get()
+        self._source_label.config(text=f"{transport} Source:")
+        self._input_frame.config(text=f"{transport} Input")
+        self._source_combo.set("")
+        self._source_combo["values"] = ()
+        self._refresh_sources()
+
+    # ------------------------------------------------------------------
     # Auto-connect on launch
     # ------------------------------------------------------------------
 
@@ -314,26 +346,30 @@ class MirageBridgeApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _refresh_sources(self):
+        transport = self._transport_var.get()
         self._refresh_btn.config(state="disabled")
         self._source_combo.set("")
         self._source_combo["values"] = ()
-        self._status_var.set("Discovering NDI sources...")
+        self._status_var.set(f"Discovering {transport} sources...")
 
         def _discover():
-            sources = NDIReceiver.discover_sources(timeout_sec=5.0)
-            self.after(0, lambda: self._on_discovery_done(sources))
+            if transport == "Spout" and SPOUT_AVAILABLE:
+                sources = SpoutReceiver.discover_sources()
+            else:
+                sources = NDIReceiver.discover_sources(timeout_sec=5.0)
+            self.after(0, lambda: self._on_discovery_done(sources, transport))
 
-        threading.Thread(target=_discover, daemon=True, name="ndi-discover").start()
+        threading.Thread(target=_discover, daemon=True, name="discover").start()
 
-    def _on_discovery_done(self, sources):
+    def _on_discovery_done(self, sources, transport):
         self._refresh_btn.config(state="normal")
         if sources:
             self._source_combo["values"] = sources
             self._source_combo.current(0)
-            self._status_var.set(f"Found {len(sources)} NDI source(s)")
+            self._status_var.set(f"Found {len(sources)} {transport} source(s)")
             self._try_auto_connect()
         else:
-            self._status_var.set("No NDI sources found")
+            self._status_var.set(f"No {transport} sources found")
 
     # ------------------------------------------------------------------
     # Connect
@@ -345,9 +381,10 @@ class MirageBridgeApp(tk.Tk):
             messagebox.showerror("Error", "API Key is required.")
             return
 
+        transport = self._transport_var.get()
         source = self._source_var.get().strip()
         if not source:
-            messagebox.showerror("Error", "Select an NDI source first (click Refresh).")
+            messagebox.showerror("Error", f"Select a {transport} source first (click Refresh).")
             return
 
         output_name = self._output_name_var.get().strip() or "NDI-Mirage-Output"
@@ -355,6 +392,7 @@ class MirageBridgeApp(tk.Tk):
 
         self._connect_btn.config(state="disabled")
         self._disconnect_btn.config(state="disabled")
+        self._transport_combo.config(state="disabled")
         self._status_var.set("Connecting...")
 
         def _do_connect():
@@ -364,23 +402,29 @@ class MirageBridgeApp(tk.Tk):
                 self._preview_buffer = FrameBuffer()
                 self._output_queue = queue.Queue(maxsize=2)
 
-                # Start NDI receiver
-                self._ndi_receiver = NDIReceiver(source, self._input_buffer)
-                self._ndi_receiver.start()
+                # Start receiver
+                if transport == "Spout" and SPOUT_AVAILABLE:
+                    self._receiver = SpoutReceiver(source, self._input_buffer)
+                else:
+                    self._receiver = NDIReceiver(source, self._input_buffer)
+                self._receiver.start()
 
                 # Wait for first frame
-                self.after(0, lambda: self._status_var.set("Waiting for NDI frames..."))
+                self.after(0, lambda: self._status_var.set(f"Waiting for {transport} frames..."))
                 got_frame = self._input_buffer.wait_for_first_frame(30.0)
                 if not got_frame:
-                    self._ndi_receiver.stop()
+                    self._receiver.stop()
                     self.after(0, lambda: self._connect_failed(
-                        "Timed out waiting for NDI frames. Check source is active."
+                        f"Timed out waiting for {transport} frames. Check source is active."
                     ))
                     return
 
-                # Start NDI sender
-                self._ndi_sender = NDISender(output_name, self._output_queue)
-                self._ndi_sender.start()
+                # Start sender
+                if transport == "Spout" and SPOUT_AVAILABLE:
+                    self._sender = SpoutSender(output_name, self._output_queue)
+                else:
+                    self._sender = NDISender(output_name, self._output_queue)
+                self._sender.start()
 
                 # Create video track and consumer
                 self._video_track = NDIVideoTrack(self._input_buffer)
@@ -451,6 +495,7 @@ class MirageBridgeApp(tk.Tk):
     def _connect_failed(self, msg: str):
         self._connect_btn.config(state="normal")
         self._disconnect_btn.config(state="disabled")
+        self._transport_combo.config(state="readonly")
         self._status_var.set("Disconnected")
         messagebox.showerror("Connection Failed", msg)
 
@@ -470,10 +515,10 @@ class MirageBridgeApp(tk.Tk):
                     self._submit_async(self._consumer.stop()).result(timeout=10)
                 if self._realtime_client:
                     self._submit_async(self._realtime_client.disconnect()).result(timeout=10)
-                if self._ndi_sender:
-                    self._ndi_sender.stop()
-                if self._ndi_receiver:
-                    self._ndi_receiver.stop()
+                if self._sender:
+                    self._sender.stop()
+                if self._receiver:
+                    self._receiver.stop()
             except Exception:
                 logger.exception("Error during disconnect")
             finally:
@@ -487,13 +532,14 @@ class MirageBridgeApp(tk.Tk):
         self._realtime_client = None
         self._consumer = None
         self._video_track = None
-        self._ndi_receiver = None
-        self._ndi_sender = None
+        self._receiver = None
+        self._sender = None
         self._input_buffer = None
         self._preview_buffer = None
         self._output_queue = None
         self._connect_btn.config(state="normal")
         self._disconnect_btn.config(state="disabled")
+        self._transport_combo.config(state="readonly")
         self._status_var.set("Disconnected")
         self._input_fps_var.set("Input FPS: --")
         self._output_fps_var.set("Output FPS: --")

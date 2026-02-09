@@ -13,6 +13,14 @@ else:
     py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     site_packages = _project / ".venv" / "lib" / py_ver / "site-packages"
 
+# SpoutGL native libraries (Windows-only)
+spout_binaries = []
+if sys.platform == "win32":
+    spout_dir = site_packages / "SpoutGL"
+    if spout_dir.exists():
+        spout_binaries += [(str(f), "SpoutGL") for f in spout_dir.glob("*.pyd")]
+        spout_binaries += [(str(f), "SpoutGL") for f in spout_dir.glob("*.dll")]
+
 # cyndilib native libraries
 cyndilib_bin = site_packages / "cyndilib" / "wrapper" / "bin"
 cyndilib_dest = os.path.join("cyndilib", "wrapper", "bin")
@@ -41,7 +49,7 @@ else:
 a = Analysis(
     ["ndi_mirage_bridge_ui.py"],
     pathex=[],
-    binaries=ndi_libs + cyndilib_exts,
+    binaries=ndi_libs + cyndilib_exts + spout_binaries,
     datas=[],
     hiddenimports=[
         "cyndilib",
@@ -68,6 +76,8 @@ a = Analysis(
         "pythonosc",
         "pythonosc.dispatcher",
         "pythonosc.osc_server",
+        "SpoutGL",
+        "SpoutGL.enums",
     ],
     hookspath=[],
     runtime_hooks=[],
