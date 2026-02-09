@@ -422,7 +422,7 @@ class MirageBridgeApp(tk.Tk):
                 model=model,
                 on_remote_stream=self._consumer.on_remote_stream,
                 initial_state=ModelState(
-                    prompt=Prompt(text=prompt_text, enrich=True)
+                    prompt=Prompt(text=prompt_text, enrich=False)
                 ),
             ),
         )

@@ -579,7 +579,7 @@ async def main() -> None:
             model=model,
             on_remote_stream=consumer.on_remote_stream,
             initial_state=ModelState(
-                prompt=Prompt(text=prompt_text, enrich=True)
+                prompt=Prompt(text=prompt_text, enrich=False)
             ),
         ),
     )
